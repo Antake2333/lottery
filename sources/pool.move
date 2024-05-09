@@ -242,7 +242,12 @@ module lottery::pool {
             ticket_price: ticket_price,
             ticket_amount: ticket_amount
         });
-        transfer::public_transfer(payment_coin,tx_context::sender(ctx));
+        // 这里需要注意一点,如果最后需要返回coin就需要发送回去,如果不需要则需要删除掉
+        if(coin::value(&payment_coin) > 0){
+            transfer::public_transfer(payment_coin,tx_context::sender(ctx));
+        }else{
+            coin::destroy_zero(payment_coin);
+        };
     }
 
 
