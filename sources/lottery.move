@@ -42,4 +42,8 @@ module lottery::lottery {
     public entry fun buy_ticket<ReceiveCoin>(pool:&mut Pool<ReceiveCoin>,payment_coin:Coin<ReceiveCoin>,clock: &Clock,ctx:&mut TxContext){
         pool::buy_ticket(pool,payment_coin,clock,ctx);
     }
+
+    public entry fun settle_pool<ReceiveCoin>(pool:&mut Pool<ReceiveCoin>, drand_sig: vector<u8>,clock: &Clock,ctx:&mut TxContext){
+        pool_manager::settle_pool(pool,drand_sig,clock,ctx);
+    }
 }

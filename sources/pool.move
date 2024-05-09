@@ -5,6 +5,8 @@ module lottery::pool {
     use std::string::String;
     use sui::balance::{Self,Balance};
     use sui::table_vec::{Self,TableVec};
+    use sui::event;
+    use std::type_name::{Self,TypeName};
 
     const PoolStatusActive: u8 = 1;
 
@@ -17,6 +19,13 @@ module lottery::pool {
 
     public struct PoolTicket has key, store {
         id: UID,
+        pool_id: ID,
+        owner_address: address,
+        ticket_price: u8,
+    }
+
+    public struct WinerPoolTicket has copy, store, drop {
+        ticket_id: ID,
         pool_id: ID,
         owner_address: address,
         ticket_price: u8,
@@ -38,6 +47,40 @@ module lottery::pool {
         pool_fee:u8, // 万分之
         settle_fee:u8, // 万分之
         fee_rate:u8 // 10000 就是万分之
+    }
+
+    // events
+
+    public struct CreatePoolEvent has copy,drop {
+        pool_id:ID,
+        name: String,
+        ticket_price: u8,
+        interval: u64, // ms
+        max_cap: u64,
+        start_time: u64,// ms
+        end_time: u64,
+        receive_coin: TypeName,
+        pool_fee_address:Option<address>,
+        pool_fee:u8, // 万分之
+        settle_fee:u8, // 万分之
+        fee_rate:u8 ,// 10000 就是万分之
+        sender: address
+    }
+
+    public struct BuyTicketEvent has copy,drop {
+        ticket_ids: vector<ID>,
+        pool_id: ID,
+        owner_address: address,
+        ticket_price: u64,
+        ticket_amount: u64,
+    }
+
+    public struct SettlePoolEvent has copy,drop {
+        pool_id:ID,
+        winner_ticket:WinerPoolTicket,
+        pool_fee_amount:u64,
+        settle_fee_amount:u64,
+        bonus:u64,
     }
 
     public(package) fun create_pool<ReceiveCoin> (
@@ -70,6 +113,21 @@ module lottery::pool {
             settle_fee:settle_fee,
             fee_rate:fee_rate
         };
+        event::emit(CreatePoolEvent {
+                    pool_id:object::uid_to_inner(&pool.id),
+                    name: *&pool.name,
+                    ticket_price: *&pool.ticket_price,
+                    interval: *&pool.interval,
+                    max_cap: *&pool.max_cap,
+                    start_time: *&pool.start_time,
+                    end_time: *&pool.end_time,
+                    receive_coin: type_name::get<ReceiveCoin>(),
+                    pool_fee_address:*&pool.pool_fee_address,
+                    pool_fee:*&pool.pool_fee, 
+                    settle_fee:*&pool.settle_fee, 
+                    fee_rate:*&pool.fee_rate,
+                    sender:tx_context::sender(ctx)
+        });
         transfer::public_share_object(pool);
     }
 
@@ -77,10 +135,10 @@ module lottery::pool {
         pool.status=status;
     }
 
-    public(package) fun reset_pool<ReceiveCoin>(pool:&mut Pool<ReceiveCoin>,start_time:u64,end_time:u64){
+    public(package) fun reset_pool<ReceiveCoin>(pool:&mut Pool<ReceiveCoin>,start_time:u64){
         // once pool settle reset pool
         pool.start_time=start_time;
-        pool.end_time=end_time;
+        pool.end_time=start_time+*&pool.interval;
         pool.sold_cap=0;
         // send rest coin to admin address
         // move to distribute_pool
@@ -99,7 +157,7 @@ module lottery::pool {
     
     #[allow(lint(self_transfer))]
     public(package) fun distribute_pool<ReceiveCoin>(pool:&mut Pool<ReceiveCoin>,
-    winner_ticket:&PoolTicket,
+    winner_ticket:WinerPoolTicket,
     ctx:&mut TxContext){
         // 这里瓜分池子,池子里面还需要一个配置就是,
         // settle_pool的人能分多少,池子手续费多少,然后剩下的全部交给中奖的人
@@ -110,19 +168,30 @@ module lottery::pool {
            let pool_fee= *&pool.pool_fee as u64;
            let settle_fee =*&pool.settle_fee as u64;
            let fee_rate=*&pool.fee_rate as u64;
+           let mut pool_fee_amont:u64 = 0;
+           let mut settle_fee_amont:u64 = 0;
            if(pool_fee > 0){
+                pool_fee_amont =  receive_coin_amount * pool_fee /  fee_rate;
                 let pool_fee_coin = coin::split(&mut rececive_coin, 
-                receive_coin_amount * pool_fee /  fee_rate
+                pool_fee_amont
                   ,ctx);
                 let reset_address= option::borrow<address>(&pool.pool_fee_address);
                 transfer::public_transfer(pool_fee_coin,*reset_address);
            };
            if(settle_fee > 0){
+                settle_fee_amont=receive_coin_amount * settle_fee /  fee_rate;
                 let settle_fee_coin = coin::split(&mut rececive_coin, 
-                receive_coin_amount * settle_fee /  fee_rate
+                settle_fee_amont
                   ,ctx);
                 transfer::public_transfer(settle_fee_coin,tx_context::sender(ctx));
            };
+           event::emit(SettlePoolEvent{
+                pool_id:object::uid_to_inner(&pool.id),
+                winner_ticket:winner_ticket,
+                pool_fee_amount:pool_fee_amont,
+                settle_fee_amount:settle_fee_amont,
+                bonus:coin::value(&rececive_coin),
+           });
            transfer::public_transfer(rececive_coin,winner_ticket.owner_address);
         };
     }
@@ -130,15 +199,16 @@ module lottery::pool {
 
     #[allow(lint(self_transfer))]
     public(package) fun buy_ticket<ReceiveCoin>(pool:&mut Pool<ReceiveCoin>,mut payment_coin:Coin<ReceiveCoin>,clock: &Clock,ctx:&mut TxContext){
-        assert!(!is_inprocess(clock::timestamp_ms(clock),*&pool.start_time,*&pool.end_time,*&pool.status),ErrPoolNotInProcess);
+        assert!(is_inprocess(clock::timestamp_ms(clock),*&pool.start_time,*&pool.end_time,*&pool.status),ErrPoolNotInProcess);
         // 这里总共给了多少coin,除单价就是ticket的张数,剩下的coin返回给购买人
         // 如果coin数量小于单张价格直接返回
         let coin_value=coin::value(&payment_coin);
         let ticket_price=*&pool.ticket_price as u64;
-        assert!(coin_value < ticket_price,ErrPoolNotEnoughOnetTicket);
+        assert!(coin_value > ticket_price,ErrPoolNotEnoughOnetTicket);
         let ticket_amount= coin_value / ticket_price;
         assert!(ticket_amount + (*&pool.sold_cap) < *&pool.max_cap,ErrPoolNotEnoughtTicket);
         let cost_coin=coin::split(&mut payment_coin,ticket_amount*ticket_price,ctx);
+        let mut ticket_ids=vector::empty<ID>();
         {
             // 这里先修改pool的数据,然后再创建ticket放到pool中
             *&mut pool.sold_cap = *&pool.sold_cap+ticket_amount;
@@ -152,10 +222,18 @@ module lottery::pool {
                     owner_address: tx_context::sender(ctx),
                     ticket_price: *&pool.ticket_price
                 };
+                vector::push_back<ID>(&mut ticket_ids,object::uid_to_inner(&pool_ticket.id));
                 table_vec::push_back(&mut pool.tickets,pool_ticket);
                 i = i + 1;
             }
         };
+        event::emit(BuyTicketEvent{
+            ticket_ids: ticket_ids,
+            pool_id: object::uid_to_inner(&pool.id),
+            owner_address: tx_context::sender(ctx),
+            ticket_price: ticket_price,
+            ticket_amount: ticket_amount
+        });
         transfer::public_transfer(payment_coin,tx_context::sender(ctx));
     }
 
@@ -170,5 +248,34 @@ module lottery::pool {
             return false
         };
         true
+    }
+
+    public fun get_start_time<ReceiveCoin>(pool:&Pool<ReceiveCoin>) :u64 {
+        pool.start_time
+    }
+
+    public fun get_end_time<ReceiveCoin>(pool:&Pool<ReceiveCoin>) :u64 {
+        pool.end_time
+    }
+
+    public fun get_sold_cap<ReceiveCoin>(pool:&Pool<ReceiveCoin>) :u64 {
+        pool.sold_cap
+    }
+    
+    public fun get_max_cap<ReceiveCoin>(pool:&Pool<ReceiveCoin>) :u64 {
+        pool.max_cap
+    }
+
+    public fun get_tickets<ReceiveCoin>(pool:&Pool<ReceiveCoin>) : &TableVec<PoolTicket> {
+        &pool.tickets
+    }
+
+    public fun copy_pool_ticket(pool_ticket:&PoolTicket) : WinerPoolTicket {
+        WinerPoolTicket {
+            ticket_id: object::uid_to_inner(&pool_ticket.id),
+            pool_id: *&pool_ticket.pool_id,
+            owner_address: *&pool_ticket.owner_address,
+            ticket_price: *&pool_ticket.ticket_price,
+        }
     }
 }
